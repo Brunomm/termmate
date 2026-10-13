@@ -1,15 +1,18 @@
 TermMate for Sublime Text
 =========================
 
-Thank you for installing the TermMate!
+Thank you for installing TermMate!
 
-This plugin provides agentic coding interface (Claude Code, Codex, OpenCode, and Pi Agent) directly within Sublime Text.
+This plugin provides agentic coding interface (Claude Code, Codex,
+Google Antigravity, OpenCode, and Pi Agent) directly within Sublime Text.
 
 Getting Started:
-- Ensure at least one of the command-line tools (`claude`, `codex`, `opencode`, or `pi`) is installed on your system based on your preference.
+- Ensure at least one of the command-line tools (`claude`, `codex`, `agy`,
+  `opencode`, or `pi`) is installed on your system based on your preference.
 - Authenticate the agents via your terminal:
   - Claude Code: Run `claude /login` in your terminal.
   - Codex: Run `codex login` in your terminal.
+  - Google Antigravity: Run `agy` in your terminal.
   - OpenCode: Run `opencode /connect` in your terminal.
   - Pi Agent: Run `pi /login` in your terminal.
 - Open the command palette and type "TermMate: Start Chat".

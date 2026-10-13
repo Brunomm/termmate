@@ -74,7 +74,7 @@ Authenticate the agents via your terminal, or skip the CLI login by setting API 
 codex login
 
 # Google Antigravity
-agy login
+agy
 
 # OpenCode
 /connect
