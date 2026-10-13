@@ -765,49 +765,51 @@ class ModelPanel:
 
         display_model = format_model_display_name(agent_provider, model)
 
-        plan_tag_html = ""
-        if plan_mode == PlanMode.PLANNING:
-            plan_tag_html = """
-                <a href="toggle_plan" class="model-tag" style="margin-left: 4px;">
-                    <span class="label">PlanMode:</span>
-                    <span class="value">planning</span>
-                </a>
-            """
-        else:
-            plan_tag_html = """
-                <a href="toggle_plan" class="model-tag" style="margin-left: 4px;">
-                    <span class="label">PlanMode:</span>
-                    <span class="value">fast</span>
-                </a>
-            """
+        display_plan_mode = plan_mode.value
+        plan_tag_html = (
+            f'<a href="toggle_plan" class="model-tag" style="margin-left: 4px;">'
+            f'<span class="label">PlanMode:</span>'
+            f'<span class="value">{display_plan_mode}</span></a>'
+        )
 
         stop_hint_html = self.status_hint.render()
+
+        agent_tag = (
+            f'<a href="set_agent" class="model-tag">'
+            f'<span class="icon">✨</span><span class="label">Agent:</span>'
+            f'<span class="value">{agent_provider}</span></a>'
+        )
+        model_tag = (
+            f'<a href="set_model" class="model-tag" style="margin-left: 4px;">'
+            f'<span class="label">Model:</span>'
+            f'<span class="value">{html.escape(display_model)}</span></a>'
+        )
 
         panel_html = f"""
         <body id="chatview-model" style="margin: 0; padding: 0;">
             <style>
                 .model-row {{
-                    margin: 0 0 6px 0;
-                    padding: 8px 0;
+                    padding: 2px 0 6px 0;
+                    margin: 0;
                     border-bottom: 1px solid color(var(--foreground) alpha(0.06));
                 }}
                 .model-tag {{
+                    display: inline-block;
                     color: var(--accent);
                     background-color: color(var(--accent) alpha(0.08));
                     border: 1px solid color(var(--accent) alpha(0.15));
-                    font-size: 0.85em;
-                    font-family: var(--font-mono);
+                    border-radius: 3px;
+                    padding: 2px 2px;
+                    font-size: 0.9em;
                     text-decoration: none;
-                    padding: 4px 2px;
-                    border-radius: 4px;
-                    line-height: 1.2;
                 }}
                 .stop-hint {{
                     color: var(--accent);
                     display: inline-block;
                     text-decoration: none;
                     margin-left: 2px;
-                    padding: 4px 2px;
+                    padding: 2px 2px;
+                    font-size: 0.9em;
                     line-height: 1.2;
                 }}
                 .icon {{
@@ -822,15 +824,7 @@ class ModelPanel:
                 }}
             </style>
             <div class="model-row">
-                <a href="set_agent" class="model-tag">
-                    <span class="icon">✨</span>
-                    <span class="label">Agent:</span>
-                    <span class="value">{agent_provider}</span>
-                </a>
-                <a href="set_model" class="model-tag" style="margin-left: 4px;">
-                    <span class="label">Model:</span>
-                    <span class="value">{html.escape(display_model)}</span>
-                </a>{plan_tag_html}{stop_hint_html}
+                {agent_tag}{model_tag}{plan_tag_html}{stop_hint_html}
             </div>
         </body>
         """
