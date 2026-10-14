@@ -767,7 +767,7 @@ class ModelPanel:
 
         display_plan_mode = plan_mode.value
         plan_tag_html = (
-            f'<a href="toggle_plan" class="model-tag" style="margin-left: 4px;">'
+            f'<a href="toggle_plan" class="model-tag">'
             f'<span class="label">PlanMode:</span>'
             f'<span class="value">{display_plan_mode}</span></a>'
         )
@@ -780,10 +780,12 @@ class ModelPanel:
             f'<span class="value">{agent_provider}</span></a>'
         )
         model_tag = (
-            f'<a href="set_model" class="model-tag" style="margin-left: 4px;">'
+            f'<a href="set_model" class="model-tag">'
             f'<span class="label">Model:</span>'
             f'<span class="value">{html.escape(display_model)}</span></a>'
         )
+
+        buttons_html = "&nbsp;".join([agent_tag, model_tag, plan_tag_html])
 
         panel_html = f"""
         <body id="chatview-model" style="margin: 0; padding: 0;">
@@ -807,9 +809,9 @@ class ModelPanel:
                     color: var(--accent);
                     display: inline-block;
                     text-decoration: none;
-                    margin-left: 2px;
+                    margin-left: 9px;
                     padding: 2px 2px;
-                    font-size: 0.9em;
+                    font-size: 1.1em;
                     line-height: 1.2;
                 }}
                 .icon {{
@@ -824,7 +826,7 @@ class ModelPanel:
                 }}
             </style>
             <div class="model-row">
-                {agent_tag}{model_tag}{plan_tag_html}{stop_hint_html}
+                {buttons_html}{stop_hint_html}
             </div>
         </body>
         """

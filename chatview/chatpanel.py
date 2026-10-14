@@ -162,8 +162,9 @@ class StatusHint:
         label = f"■ {self.text}" if self.stopping else "■"
         shortcut = "⌘+Esc" if sublime.platform() == "osx" else "shift+esc"
         title = f"Stop conversation ({shortcut})"
-        return f'''\
-            <a href="stop_conversation" class="stop-hint" title="{title}">{label}</a>'''
+        return (
+            f'<a href="stop_conversation" class="stop-hint" title="{title}">{label}</a>'
+        )
 
 
 class LoadingAnimation:
