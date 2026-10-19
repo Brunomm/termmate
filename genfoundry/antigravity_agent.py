@@ -12,8 +12,9 @@ import re
 import shutil
 import signal
 import sys
+import datetime
 from urllib.parse import urlparse, unquote
-from typing import Optional, Dict, Any, AsyncIterator, List
+from typing import Optional, Dict, Any, AsyncIterator, List, Set, Tuple
 
 # logger by package name
 LOG = logging.getLogger("TermMate")
@@ -918,83 +919,116 @@ def _clean_antigravity_prompt(content: str) -> str:
     return " ".join(text.split())
 
 
-def _is_abs_path(path: str) -> bool:
-    """Return True if path looks like an absolute path on POSIX or Windows."""
-    return bool(
-        isinstance(path, str)
-        and (os.path.isabs(path) or re.match(r"^([a-zA-Z]:[\\/]|/)", path))
+def _parse_iso_timestamp(ts_str: str) -> float:
+    """Parse ISO-8601 UTC timestamp to unix epoch float."""
+    try:
+        norm = ts_str.replace("Z", "+00:00")
+        s = re.sub(r"\.(\d+)", lambda m: "." + m.group(1).ljust(6, "0")[:6], norm)
+        dt = datetime.datetime.fromisoformat(s)
+        return float(dt.timestamp()) if dt.year > 1 else 0.0
+    except Exception:
+        return 0.0
+
+
+def _is_workspace_match(ws_path: str, norm_cwd: str) -> bool:
+    """Check if a workspace path matches the target cwd (equal or parent/child)."""
+    if not ws_path or not norm_cwd:
+        return False
+    norm_ws = os.path.normcase(os.path.realpath(ws_path))
+    return (
+        norm_ws == norm_cwd
+        or norm_cwd.startswith(norm_ws + os.sep)
+        or norm_ws.startswith(norm_cwd + os.sep)
     )
 
 
-def _is_valid_workspace_path(path: str, base_dir: str) -> bool:
-    """Return True if path is an absolute path outside internal ~/.gemini base_dir."""
-    if not _is_abs_path(path):
-        return False
-    p = path.replace("\\", "/").rstrip("/")
-    b = (base_dir or "").replace("\\", "/").rstrip("/")
-    return not (b and (p == b or p.startswith(b + "/")))
+def _read_transcript_summary_and_mtime(session_id: str) -> Tuple[str, float]:
+    """
+    Read first valid USER_INPUT prompt and file mtime from brain transcript logs.
+    Returns: (summary: str, mtime: float)
+    """
+    for t_path in _get_transcript_paths(session_id):
+        if not os.path.isfile(t_path):
+            continue
+        try:
+            mtime = os.path.getmtime(t_path)
+        except OSError:
+            mtime = 0.0
 
-
-def _dir_from_path(path: str) -> str:
-    """Return containing directory if path is a file, or path itself if directory."""
-    if not path or os.path.isdir(path):
-        return path or ""
-    d = os.path.dirname(path)
-    if not d and "\\" in path:
-        d = path.rsplit("\\", 1)[0]
-    return d or path
-
-
-_WS_CWD_RE = re.compile(
-    r"(?:Command Working Directory:\s*|Active Workspaces:\s*[\r\n]+-\s*)([^\r\n]+)"
-)
+        summary = ""
+        try:
+            with open(t_path, "r", encoding="utf-8", errors="replace") as f:
+                for idx, line in enumerate(f):
+                    if idx > 15:
+                        break
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        rec = json.loads(line)
+                    except Exception:
+                        continue
+                    if rec.get("type") == "USER_INPUT":
+                        cleaned = _clean_antigravity_prompt(rec.get("content") or "")
+                        if cleaned and not cleaned.startswith("/"):
+                            summary = cleaned
+                            break
+        except Exception:
+            pass
+        return summary, mtime
+    return "", 0.0
 
 
 def list_antigravity_sessions(cwd: Optional[str] = None) -> List[Dict[str, Any]]:
     """
-    List past Antigravity conversations from ~/.gemini/antigravity-cli/brain and history.jsonl.
-    Returns list of {'session_id': str, 'summary': str, 'mtime': float} sorted newest-first.
+    List past Antigravity conversations from ~/.gemini/antigravity-cli cache, brain, and history.
+    Returns list of {'session_id': str, 'summary': str, 'mtime': float, ...} sorted newest-first.
     """
     base_dir = _get_base_dir()
-    brain_dir = os.path.join(base_dir, "brain")
     history_file = _get_history_file()
     last_conv_file = os.path.join(base_dir, "cache", "last_conversations.json")
     meta_file = os.path.join(base_dir, "cache", "conversation_metadata.json")
 
-    ws_by_id: Dict[str, str] = {}
+    sessions_by_id: Dict[str, Dict[str, Any]] = {}
 
-    # 1. Preload workspace mappings from cache/last_conversations.json
-    if os.path.isfile(last_conv_file):
-        try:
-            with open(last_conv_file, "r", encoding="utf-8", errors="replace") as f:
-                data = json.load(f)
-                if isinstance(data, dict):
-                    for ws, cid in data.items():
-                        if isinstance(cid, str) and isinstance(ws, str):
-                            ws_by_id[cid] = ws
-        except Exception:
-            pass
-
-    # 2. Preload workspace mappings from cache/conversation_metadata.json
+    # 1. Main metadata: bulk load structured sessions (Title, Steps, UpdatedAt, WorkspaceURIs)
     if os.path.isfile(meta_file):
         try:
             with open(meta_file, "r", encoding="utf-8", errors="replace") as f:
                 data = json.load(f)
                 if isinstance(data, dict):
                     for cid, c_data in data.get("conversations", {}).items():
-                        if cid not in ws_by_id and isinstance(c_data, dict):
-                            summary = c_data.get("summary", {})
-                            uris = summary.get("WorkspaceURIs") or []
-                            for u in uris:
-                                if isinstance(u, str) and u.startswith("file://"):
-                                    ws_by_id[cid] = unquote(urlparse(u).path)
-                                    break
-        except Exception:
-            pass
+                        if not isinstance(c_data, dict):
+                            continue
+                        summary = c_data.get("summary") or {}
+                        num_steps = summary.get("NumSteps", 0)
+                        if num_steps <= 0:
+                            continue
 
-    history_entries: List[Dict[str, Any]] = []
+                        uris = summary.get("WorkspaceURIs") or []
+                        ws_set: Set[str] = set()
+                        for u in uris:
+                            if isinstance(u, str) and u.startswith("file://"):
+                                path = unquote(urlparse(u).path)
+                                if path:
+                                    ws_set.add(path)
 
-    # 3. Preload workspace mappings and entries from history.jsonl
+                        title = (summary.get("Title") or summary.get("Preview") or "").strip()
+                        mtime = _parse_iso_timestamp(summary.get("UpdatedAt") or "")
+                        if mtime <= 0:
+                            mtime = _parse_iso_timestamp(c_data.get("last_modified_time") or "")
+
+                        sessions_by_id[cid] = {
+                            "session_id": cid,
+                            "summary": title,
+                            "mtime": mtime,
+                            "workspaces": ws_set,
+                            "steps": num_steps,
+                        }
+        except Exception as e:
+            LOG.debug(f"Error reading conversation metadata: {e}")
+
+    # 2. Single-pass merge: history.jsonl (augments workspaces and missing active sessions)
     if os.path.isfile(history_file):
         try:
             with open(history_file, "r", encoding="utf-8", errors="replace") as f:
@@ -1006,158 +1040,106 @@ def list_antigravity_sessions(cwd: Optional[str] = None) -> List[Dict[str, Any]]
                         entry = json.loads(line)
                     except Exception:
                         continue
-                    if isinstance(entry, dict):
-                        history_entries.append(entry)
-                        cid = entry.get("conversationId")
-                        ws = entry.get("workspace")
-                        if cid and ws and cid not in ws_by_id:
-                            ws_by_id[cid] = ws
-        except Exception:
-            pass
 
-    sessions_by_id: Dict[str, Dict[str, Any]] = {}
+                    cid = entry.get("conversationId")
+                    if not cid:
+                        continue
 
-    # 4. Scan brain/ directory (standard headless and interactive session logs)
-    if os.path.isdir(brain_dir):
-        try:
-            for entry in os.scandir(brain_dir):
-                if not entry.is_dir():
-                    continue
-                cid = entry.name
-                # Prefer lossless full log over compact truncated log
-                t_path = os.path.join(entry.path, ".system_generated", "logs", "transcript_full.jsonl")
-                if not os.path.isfile(t_path):
-                    t_path = os.path.join(entry.path, ".system_generated", "logs", "transcript.jsonl")
-                if not os.path.isfile(t_path):
-                    continue
+                    ws = entry.get("workspace")
+                    timestamp_ms = entry.get("timestamp") or 0
+                    mtime = float(timestamp_ms) / 1000.0 if timestamp_ms else 0.0
+                    display = entry.get("display") or ""
+                    cleaned = _clean_antigravity_prompt(display)
 
-                try:
-                    mtime = os.path.getmtime(t_path)
-                except OSError:
-                    continue
-
-                ws = ws_by_id.get(cid)
-                summary = ""
-                cmd_fallback = ""
-
-                try:
-                    with open(t_path, "r", encoding="utf-8", errors="replace") as f:
-                        for idx, line in enumerate(f):
-                            line = line.strip()
-                            if not line:
-                                continue
-                            try:
-                                rec = json.loads(line)
-                            except Exception:
-                                continue
-
-                            rec_type = rec.get("type")
-                            content = rec.get("content") or ""
-
-                            if rec_type == "USER_INPUT" and not summary:
-                                cleaned = _clean_antigravity_prompt(content)
-                                if cleaned:
-                                    if cleaned.startswith("/"):
-                                        if not cmd_fallback:
-                                            cmd_fallback = cleaned
-                                    else:
-                                        summary = cleaned
-
-                            if not ws:
-                                for call in rec.get("tool_calls", []):
-                                    args = call.get("args") or {}
-                                    if isinstance(args, str):
-                                        try:
-                                            args = json.loads(args)
-                                        except Exception:
-                                            pass
-                                    if isinstance(args, dict):
-                                        for k in ("Cwd", "SearchPath", "DirectoryPath"):
-                                            val = args.get(k)
-                                            if val and isinstance(val, str):
-                                                val = val.strip("\"'")
-                                                if _is_valid_workspace_path(val, base_dir):
-                                                    ws = val
-                                                    break
-                                        if not ws:
-                                            val = args.get("AbsolutePath")
-                                            if val and isinstance(val, str):
-                                                val = val.strip("\"'")
-                                                if _is_valid_workspace_path(val, base_dir):
-                                                    ws = _dir_from_path(val)
-                                    if ws:
-                                        break
-
-                                if not ws:
-                                    m = _WS_CWD_RE.search(content)
-                                    if m:
-                                        val = m.group(1).strip().strip("\"'")
-                                        if _is_valid_workspace_path(val, base_dir):
-                                            ws = val
-
-                            # Break early once we have both summary and workspace
-                            if idx > 30 and (summary or cmd_fallback) and ws:
-                                break
-                except Exception as e:
-                    LOG.debug(f"Error scanning transcript {t_path}: {e}")
-
-                final_summary = summary or cmd_fallback
-                sessions_by_id[cid] = {
-                    "session_id": cid,
-                    "summary": final_summary,
-                    "mtime": mtime,
-                    "workspace": ws,
-                }
+                    if cid in sessions_by_id:
+                        curr = sessions_by_id[cid]
+                        if ws:
+                            curr["workspaces"].add(ws)
+                        if not curr.get("summary") and cleaned and not cleaned.startswith("/"):
+                            curr["summary"] = cleaned
+                        if mtime > curr.get("mtime", 0.0):
+                            curr["mtime"] = mtime
+                    else:
+                        is_slash = cleaned.startswith("/")
+                        ws_set = {ws} if ws else set()
+                        sessions_by_id[cid] = {
+                            "session_id": cid,
+                            "summary": "" if is_slash else cleaned,
+                            "mtime": mtime,
+                            "workspaces": ws_set,
+                            "steps": 0,
+                        }
         except Exception as e:
-            LOG.warning(f"Failed to scan antigravity brain dir: {e}")
+            LOG.warning(f"Failed to read antigravity history: {e}")
 
-    # 5. Merge any sessions recorded only in history.jsonl
-    for entry in history_entries:
-        cid = entry.get("conversationId")
-        if not cid:
-            continue
+    # 3. Active mappings: last_conversations.json (augments active workspace mapping per directory)
+    if os.path.isfile(last_conv_file):
+        try:
+            with open(last_conv_file, "r", encoding="utf-8", errors="replace") as f:
+                data = json.load(f)
+                if isinstance(data, dict):
+                    for ws, cid in data.items():
+                        if isinstance(cid, str) and isinstance(ws, str) and ws:
+                            if cid in sessions_by_id:
+                                sessions_by_id[cid]["workspaces"].add(ws)
+                            else:
+                                sessions_by_id[cid] = {
+                                    "session_id": cid,
+                                    "summary": "",
+                                    "mtime": 0.0,
+                                    "workspaces": {ws},
+                                    "steps": 0,
+                                }
+        except Exception as e:
+            LOG.debug(f"Error reading last conversations: {e}")
 
-        ws = entry.get("workspace")
-        timestamp_ms = entry.get("timestamp") or 0
-        mtime = float(timestamp_ms) / 1000.0 if timestamp_ms else 0.0
-        display = entry.get("display") or ""
-        cleaned = _clean_antigravity_prompt(display)
-
-        if cid in sessions_by_id:
-            curr = sessions_by_id[cid]
-            if not curr.get("workspace") and ws:
-                curr["workspace"] = ws
-            if not curr.get("summary") and cleaned and not cleaned.startswith("/"):
-                curr["summary"] = cleaned
+    # 4. Fast targeted fallback & transcript mtime calibration
+    for cid, s in sessions_by_id.items():
+        if not s.get("summary"):
+            fb_summary, fb_mtime = _read_transcript_summary_and_mtime(cid)
+            if fb_summary:
+                s["summary"] = fb_summary
+            if fb_mtime > s.get("mtime", 0.0):
+                s["mtime"] = fb_mtime
         else:
-            is_slash = cleaned.startswith("/")
-            sessions_by_id[cid] = {
-                "session_id": cid,
-                "summary": "" if is_slash else cleaned,
-                "mtime": mtime,
-                "workspace": ws,
-            }
+            for t_path in _get_transcript_paths(cid):
+                if os.path.isfile(t_path):
+                    try:
+                        mt = os.path.getmtime(t_path)
+                        if mt > s.get("mtime", 0.0):
+                            s["mtime"] = mt
+                    except OSError:
+                        pass
+                    break
 
-    # 6. Filter by cwd if requested
+    # 5. Filter by cwd if requested
     results = []
     norm_cwd = os.path.normcase(os.path.realpath(cwd)) if cwd else None
 
     for s in sessions_by_id.values():
-        ws = s.get("workspace")
+        ws_set = s.get("workspaces") or set()
+        matched_ws = None
         if norm_cwd:
-            if not ws:
+            if not ws_set:
                 continue
-            norm_ws = os.path.normcase(os.path.realpath(ws))
-            if norm_ws != norm_cwd and not norm_cwd.startswith(norm_ws + os.sep) and not norm_ws.startswith(norm_cwd + os.sep):
+            for ws in ws_set:
+                if _is_workspace_match(ws, norm_cwd):
+                    matched_ws = ws
+                    break
+            if not matched_ws:
                 continue
+        else:
+            matched_ws = next(iter(ws_set), None) if ws_set else None
 
         results.append({
             "session_id": s["session_id"],
             "summary": s["summary"] or "(empty)",
             "mtime": s["mtime"],
+            "steps": s.get("steps", 0),
+            "workspace": matched_ws,
         })
 
-    # 7. Sort newest first (reverse chronological order)
+    # 6. Sort newest first (reverse chronological order)
     results.sort(key=lambda s: s["mtime"], reverse=True)
     return results
 

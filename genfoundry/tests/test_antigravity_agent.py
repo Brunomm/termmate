@@ -17,6 +17,9 @@ from genfoundry.antigravity_agent import (
     _clean_antigravity_prompt,
     _get_transcript_paths,
     _get_base_dir,
+    _parse_iso_timestamp,
+    _is_workspace_match,
+    _read_transcript_summary_and_mtime,
 )
 from genfoundry.base_agent import AgentOptions, Message
 
@@ -657,43 +660,39 @@ class TestAntigravitySessions(unittest.TestCase):
 
     def test_list_sessions_from_brain_transcripts_reverse_chronological(self):
         with tempfile.TemporaryDirectory() as tmpdir:
-            brain_dir = os.path.join(tmpdir, "brain")
-            # Session 1: Older mtime
-            s1_log_dir = os.path.join(brain_dir, "s1", ".system_generated", "logs")
-            os.makedirs(s1_log_dir, exist_ok=True)
-            s1_file = os.path.join(s1_log_dir, "transcript.jsonl")
-            with open(s1_file, "w") as f:
-                f.write(json.dumps({
-                    "type": "USER_INPUT",
-                    "content": "<USER_REQUEST>\nOld first task\n</USER_REQUEST>",
-                    "step_index": 0,
-                }) + "\n")
-                f.write(json.dumps({
-                    "type": "PLANNER_RESPONSE",
-                    "tool_calls": [{"name": "run_command", "args": {"Cwd": "/workspace/target"}}],
-                    "step_index": 1,
-                }) + "\n")
-            os.utime(s1_file, (1700000000.0, 1700000000.0))
-
-            # Session 2: Newer mtime
-            s2_log_dir = os.path.join(brain_dir, "s2", ".system_generated", "logs")
-            os.makedirs(s2_log_dir, exist_ok=True)
-            s2_file = os.path.join(s2_log_dir, "transcript.jsonl")
-            with open(s2_file, "w") as f:
-                f.write(json.dumps({
-                    "type": "USER_INPUT",
-                    "content": "<USER_REQUEST>\nNew second task\n</USER_REQUEST>",
-                    "step_index": 0,
-                }) + "\n")
-                f.write(json.dumps({
-                    "type": "PLANNER_RESPONSE",
-                    "tool_calls": [{"name": "run_command", "args": {"Cwd": "/workspace/target"}}],
-                    "step_index": 1,
-                }) + "\n")
-            os.utime(s2_file, (1700000500.0, 1700000500.0))
+            cache_dir = os.path.join(tmpdir, "cache")
+            os.makedirs(cache_dir, exist_ok=True)
+            meta_path = os.path.join(cache_dir, "conversation_metadata.json")
+            data = {
+                "conversations": {
+                    "s1": {
+                        "summary": {
+                            "ID": "s1",
+                            "Title": "Old first task",
+                            "NumSteps": 2,
+                            "UpdatedAt": "2026-10-16T10:00:00Z",
+                            "WorkspaceURIs": ["file:///workspace/target"],
+                        }
+                    },
+                    "s2": {
+                        "summary": {
+                            "ID": "s2",
+                            "Title": "New second task",
+                            "NumSteps": 3,
+                            "UpdatedAt": "2026-10-16T12:00:00Z",
+                            "WorkspaceURIs": ["file:///workspace/target"],
+                        }
+                    },
+                }
+            }
+            with open(meta_path, "w") as f:
+                json.dump(data, f)
 
             with patch("genfoundry.antigravity_agent._get_base_dir", return_value=tmpdir), \
-                 patch("genfoundry.antigravity_agent._get_history_file", return_value=os.path.join(tmpdir, "history.jsonl")):
+                 patch(
+                     "genfoundry.antigravity_agent._get_history_file",
+                     return_value=os.path.join(tmpdir, "history.jsonl"),
+                 ):
                 sessions = list_antigravity_sessions("/workspace/target")
                 self.assertEqual(len(sessions), 2)
                 # Verify reverse chronological ordering (newest first)
@@ -705,25 +704,39 @@ class TestAntigravitySessions(unittest.TestCase):
 
     def test_list_sessions_filters_by_cwd(self):
         with tempfile.TemporaryDirectory() as tmpdir:
-            brain_dir = os.path.join(tmpdir, "brain")
-            # Session for workspace A
-            sA_dir = os.path.join(brain_dir, "sA", ".system_generated", "logs")
-            os.makedirs(sA_dir, exist_ok=True)
-            sA_file = os.path.join(sA_dir, "transcript.jsonl")
-            with open(sA_file, "w") as f:
-                f.write(json.dumps({"type": "USER_INPUT", "content": "Task A"}) + "\n")
-                f.write(json.dumps({"type": "PLANNER_RESPONSE", "tool_calls": [{"name": "run_command", "args": {"Cwd": "/workspace/a"}}]}) + "\n")
-
-            # Session for workspace B
-            sB_dir = os.path.join(brain_dir, "sB", ".system_generated", "logs")
-            os.makedirs(sB_dir, exist_ok=True)
-            sB_file = os.path.join(sB_dir, "transcript.jsonl")
-            with open(sB_file, "w") as f:
-                f.write(json.dumps({"type": "USER_INPUT", "content": "Task B"}) + "\n")
-                f.write(json.dumps({"type": "PLANNER_RESPONSE", "tool_calls": [{"name": "run_command", "args": {"Cwd": "/workspace/b"}}]}) + "\n")
+            cache_dir = os.path.join(tmpdir, "cache")
+            os.makedirs(cache_dir, exist_ok=True)
+            meta_path = os.path.join(cache_dir, "conversation_metadata.json")
+            data = {
+                "conversations": {
+                    "sA": {
+                        "summary": {
+                            "ID": "sA",
+                            "Title": "Task A",
+                            "NumSteps": 2,
+                            "UpdatedAt": "2026-10-16T10:00:00Z",
+                            "WorkspaceURIs": ["file:///workspace/a"],
+                        }
+                    },
+                    "sB": {
+                        "summary": {
+                            "ID": "sB",
+                            "Title": "Task B",
+                            "NumSteps": 2,
+                            "UpdatedAt": "2026-10-16T11:00:00Z",
+                            "WorkspaceURIs": ["file:///workspace/b"],
+                        }
+                    },
+                }
+            }
+            with open(meta_path, "w") as f:
+                json.dump(data, f)
 
             with patch("genfoundry.antigravity_agent._get_base_dir", return_value=tmpdir), \
-                 patch("genfoundry.antigravity_agent._get_history_file", return_value=os.path.join(tmpdir, "history.jsonl")):
+                 patch(
+                     "genfoundry.antigravity_agent._get_history_file",
+                     return_value=os.path.join(tmpdir, "history.jsonl"),
+                 ):
                 sessions_a = list_antigravity_sessions("/workspace/a")
                 self.assertEqual(len(sessions_a), 1)
                 self.assertEqual(sessions_a[0]["session_id"], "sA")
@@ -886,6 +899,123 @@ class TestAntigravityModelLifecycle(unittest.IsolatedAsyncioTestCase):
         msg = await self.agent.message_queue.get()
         self.assertEqual(msg.type, "models_update")
         self.assertEqual(len(msg.content["models"]), 1)
+
+
+class TestAntigravityMetadataAndSessionDiscovery(unittest.TestCase):
+    def test_parse_iso_timestamp(self):
+        ts = "2026-10-16T15:00:00Z"
+        val = _parse_iso_timestamp(ts)
+        self.assertGreater(val, 0.0)
+
+        # Microseconds handling
+        ts_micro = "2026-10-16T15:00:00.123456Z"
+        val_micro = _parse_iso_timestamp(ts_micro)
+        self.assertGreater(val_micro, val)
+
+        # Invalid returns 0.0
+        self.assertEqual(_parse_iso_timestamp("invalid"), 0.0)
+
+    def test_is_workspace_match(self):
+        ws = "/path/to/project"
+        norm_cwd = os.path.normcase(os.path.realpath("/path/to/project"))
+        self.assertTrue(_is_workspace_match(ws, norm_cwd))
+
+        # Subdirectory match
+        norm_sub = os.path.normcase(os.path.realpath("/path/to/project/src/sub"))
+        self.assertTrue(_is_workspace_match(ws, norm_sub))
+
+        # Parent directory match
+        norm_parent = os.path.normcase(os.path.realpath("/path/to"))
+        self.assertTrue(_is_workspace_match(ws, norm_parent))
+
+        # Unrelated path
+        norm_other = os.path.normcase(os.path.realpath("/other/project"))
+        self.assertFalse(_is_workspace_match(ws, norm_other))
+        self.assertFalse(_is_workspace_match("", norm_cwd))
+
+    def test_read_transcript_summary_and_mtime(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            cid = "sess-direct-1"
+            # When transcript exists
+            log_dir = os.path.join(tmp_dir, "brain", cid, ".system_generated", "logs")
+            os.makedirs(log_dir, exist_ok=True)
+            t_path = os.path.join(log_dir, "transcript.jsonl")
+            with open(t_path, "w") as f:
+                f.write(json.dumps({
+                    "type": "USER_INPUT",
+                    "content": "Optimize search index query",
+                }) + "\n")
+
+            with patch("genfoundry.antigravity_agent._get_base_dir", return_value=tmp_dir):
+                summary, mtime = _read_transcript_summary_and_mtime(cid)
+                self.assertEqual(summary, "Optimize search index query")
+                self.assertGreater(mtime, 0.0)
+
+    def test_list_antigravity_sessions_metadata_multi_workspace_and_title(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            cache_dir = os.path.join(tmp_dir, "cache")
+            os.makedirs(cache_dir, exist_ok=True)
+            meta_path = os.path.join(cache_dir, "conversation_metadata.json")
+
+            ws_alpha = os.path.join(tmp_dir, "workspace_alpha")
+            ws_beta = os.path.join(tmp_dir, "workspace_beta")
+            ws_gamma = os.path.join(tmp_dir, "workspace_gamma")
+            ws_unrelated = os.path.join(tmp_dir, "workspace_unrelated")
+            for w in (ws_alpha, ws_beta, ws_gamma, ws_unrelated):
+                os.makedirs(w, exist_ok=True)
+
+            data = {
+                "conversations": {
+                    "sess-1": {
+                        "summary": {
+                            "ID": "sess-1",
+                            "Title": "Multi Root Project Work",
+                            "NumSteps": 5,
+                            "UpdatedAt": "2026-10-16T15:00:00Z",
+                            "WorkspaceURIs": [
+                                f"file://{ws_alpha}",
+                                f"file://{ws_beta}",
+                                f"file://{ws_gamma}",
+                            ],
+                        }
+                    },
+                    "sess-empty": {
+                        "summary": {
+                            "ID": "sess-empty",
+                            "Title": "Empty Session",
+                            "NumSteps": 0,
+                            "UpdatedAt": "2026-10-16T15:00:00Z",
+                            "WorkspaceURIs": [f"file://{ws_beta}"],
+                        }
+                    },
+                }
+            }
+            with open(meta_path, "w") as f:
+                json.dump(data, f)
+
+            hist_file = os.path.join(tmp_dir, "history.jsonl")
+            with patch("genfoundry.antigravity_agent._get_base_dir", return_value=tmp_dir), \
+                 patch("genfoundry.antigravity_agent._get_history_file", return_value=hist_file):
+                # Query with second workspace: ws_beta (should find sess-1)
+                results_beta = list_antigravity_sessions(ws_beta)
+                self.assertEqual(len(results_beta), 1)
+                self.assertEqual(results_beta[0]["session_id"], "sess-1")
+                self.assertEqual(results_beta[0]["summary"], "Multi Root Project Work")
+                self.assertEqual(results_beta[0]["steps"], 5)
+
+                # Query with third workspace: ws_gamma (should also find sess-1)
+                results_gamma = list_antigravity_sessions(ws_gamma)
+                self.assertEqual(len(results_gamma), 1)
+                self.assertEqual(results_gamma[0]["session_id"], "sess-1")
+
+                # Query with unrelated workspace: should return 0
+                results_unrelated = list_antigravity_sessions(ws_unrelated)
+                self.assertEqual(len(results_unrelated), 0)
+
+                # Query with None (all): returns sess-1, skips sess-empty (0 steps)
+                results_all = list_antigravity_sessions(None)
+                self.assertEqual(len(results_all), 1)
+                self.assertEqual(results_all[0]["session_id"], "sess-1")
 
 
 if __name__ == "__main__":
