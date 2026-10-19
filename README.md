@@ -354,6 +354,7 @@ These settings can be added or changed in `Preferences → Package Settings → 
 
 - **Selection as Context**: Select code before starting a chat to focus the agent's attention on specific logic.
 - **Iterative Refinement**: Use **Planning Mode** for large architectural changes to see the agent's proposed steps before they are applied.
+- **Preview Artifacts & Chat**: Use **[MarkdownPreviewOverlay](https://packagecontrol.io/packages/MarkdownPreviewOverlay)** to preview Markdown artifacts and chat messages in the active tab.
 - **Reviewing Changes with Sourcetree and Sublime Merge**: Use dedicated Git GUIs like [Sourcetree](https://www.sourcetreeapp.com/) or [Sublime Merge](https://www.sublimemerge.com/) to review file diffs after the agent makes edits. Instead of manually accepting or rejecting changes line by line, simply tell the agent what to adjust and let it refine the diff.
 
 ## Privacy & Data Handling
