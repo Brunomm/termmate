@@ -3062,8 +3062,8 @@ class TermChatResumeSessionCommand(sublime_plugin.WindowCommand):
             if len(summary) > self._PREVIEW_LEN:
                 summary = summary[:self._PREVIEW_LEN] + "…"
             dt = datetime.datetime.fromtimestamp(s["mtime"]).strftime("%Y-%m-%d %H:%M")
-            marker = " ●" if sid == current_session_id else ""
-            items.append([f"{summary}{marker}", f"{sid[:8]}  {dt}"])
+            marker = "  ●" if sid == current_session_id else ""
+            items.append([summary, f"{sid[:8]}  {dt}{marker}"])
 
         def on_select(index):
             if index < 0:
