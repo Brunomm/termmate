@@ -104,6 +104,10 @@ The example above sets `GEMINI_API_KEY` for Pi Agent authentication.
 
 You can stop a running conversation at any time. Use the shortcut `Cmd+Escape` (Mac) / `Shift+Escape` (Windows/Linux) in the chat window, or run `TermMate: Stop Conversation` from the command palette.
 
+**Multiple chats at once**
+
+You can keep several independent chats open in the same window — each with its own conversation, agent, model, plan mode and workspace. `TermMate: Start Chat` focuses the most recent chat (or creates the first one); run `TermMate: New Chat` to open an additional one. Each chat appears as its own tab (`Chat View`, `Chat View 2`, …). Commands such as `TermMate: Quick Message`, `TermMate: Chat with Agent`, agent/model/plan-mode changes, and the send/interrupt shortcuts always act on the chat that currently has focus. When resuming a past session via `TermMate: Resume Session`, you can choose to open it in a new chat or to replace the current one.
+
 For a detailed guide, see the [TermMate Documentation](https://termmate.app/docs/setup)
 
 Have questions or feedback, join the [Sublime Forum discussion](https://forum.sublimetext.com/t/using-agentic-coding-in-st-with-codex-claude-cli/78323)
@@ -218,7 +222,8 @@ When confirmed, TermMate forks the session at the selected prompt, removes all s
 | Action | macOS | Windows/Linux | Command Palette |
 | :--- | :--- | :--- | :--- |
 | **Install Agent** | - | - | `TermMate: Install Agent` |
-| **Start New Chat** | - | - | `TermMate: Start Chat` |
+| **Start Chat (focus existing)** | - | - | `TermMate: Start Chat` |
+| **Open Additional Chat** | - | - | `TermMate: New Chat` |
 | **Quick Message** | - | - | `TermMate: Quick Message` |
 | **Split Chat Window** | - | - | `TermMate: Split Chat Window` |
 | **Send Message** | `Cmd+Enter` | `Ctrl+Enter` | - |

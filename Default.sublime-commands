@@ -4,6 +4,10 @@
         "command": "term_chat_cli"
     },
     {
+        "caption": "TermMate: New Chat\topen additional chat",
+        "command": "term_chat_new_chat"
+    },
+    {
         "caption": "TermMate: Quick Message\tsend message directly",
         "command": "term_chat_prompt"
     },

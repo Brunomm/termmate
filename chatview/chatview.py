@@ -64,9 +64,123 @@ PROMPT_PREFIX = "\n❯ "  # transcript prefix for submitted prompts; the live in
 PREFERENCES_CHANGE_KEY = "termmate_chatview_preferences"
 
 
-# Global store for active ChatSession: window_id -> ChatSession
+# Global store for active ChatSessions, keyed by the chat view's id so a
+# window can host several independent chats at once.
 chatview_clients = {}
+# Last focused chat view per window: window_id -> view_id. Volatile by design;
+# rebuilt as chat views are activated and reconciled against the registry.
+_last_active_chat = {}
 preferences_redraw_scheduled = False
+
+
+def _session_for_view(view):
+    """Return the ChatSession owning this view, or None."""
+    if view is None:
+        return None
+    return chatview_clients.get(view.id())
+
+
+def _chat_views_in_window(window):
+    """All chat views in the window, in tab order."""
+    return [v for v in window.views() if v.settings().get(CHAT_VIEW_FLAG, False)]
+
+
+def _target_chat_view(window):
+    """The chat view commands should act on: the focused chat view, else the
+    most recently focused one, else the first chat view in the window."""
+    if window is None:
+        return None
+    active = window.active_view()
+    if active is not None and active.settings().get(CHAT_VIEW_FLAG, False):
+        return active
+    last_id = _last_active_chat.get(window.id())
+    if last_id is not None:
+        view = _view_by_id(window, last_id)
+        if view is not None:
+            return view
+    chats = _chat_views_in_window(window)
+    return chats[0] if chats else None
+
+
+def _view_by_id(window, view_id):
+    for v in window.views():
+        if v.id() == view_id:
+            return v
+    return None
+
+
+def _session_for_window(window):
+    """Session of the window's target chat view, or None."""
+    return _session_for_view(_target_chat_view(window))
+
+
+def _chat_setting(view, key, default=None):
+    """Read a per-chat setting: the chat view first, falling back to the
+    window-level value (legacy sessions and defaults for new chats)."""
+    settings = view.settings()
+    if settings.has(key):
+        return settings.get(key)
+    window = view.window()
+    if window is not None:
+        value = window.settings().get(key)
+        if value is not None:
+            return value
+    return default
+
+
+def _set_chat_setting(view, key, value):
+    """Write a per-chat setting to the view and mirror it on the window, so
+    the next chat created in this window inherits the most recent choice."""
+    view.settings().set(key, value)
+    window = view.window()
+    if window is not None:
+        window.settings().set(key, value)
+
+
+# Per-chat settings that live on the chat view (window value acts as the
+# default inherited by newly created chats).
+# NOTE: CHAT_APPROVE_MODE is only defined further below in this file, so its
+# literal value is used here to avoid a NameError at import time.
+_PER_CHAT_SETTING_KEYS = (
+    CHAT_AGENT,
+    CHAT_MODEL,
+    CHAT_THINK_LEVEL,
+    CHAT_PLAN_MODE,
+    "chatview_approve_mode",  # CHAT_APPROVE_MODE (defined below)
+    CHAT_WORKSPACE,
+    "chatview_sandbox_mode",
+)
+
+
+def _inherit_chat_settings(view):
+    """Seed a chat view's per-chat settings from the window-level values, so a
+    newly opened chat starts from the window's most recent choices."""
+    window = view.window()
+    if window is None:
+        return
+    window_settings = window.settings()
+    agent = _chat_setting(view, CHAT_AGENT, "claude") or "claude"
+    dynamic_keys = (
+        f"chatview_model_{agent}",
+        f"chatview_think_level_{agent}",
+        f"chatview_sandbox_mode_{agent}",
+    )
+    for key in _PER_CHAT_SETTING_KEYS + dynamic_keys:
+        if not view.settings().has(key):
+            value = window_settings.get(key)
+            if value is not None:
+                view.settings().set(key, value)
+
+
+def _next_chat_name(window):
+    """Unique chat tab name: 'Chat View', 'Chat View 2', 'Chat View 3', ..."""
+    existing = {v.name() for v in window.views()}
+    if CHAT_VIEW_NAME not in existing:
+        return CHAT_VIEW_NAME
+    index = 2
+    while f"{CHAT_VIEW_NAME} {index}" in existing:
+        index += 1
+    return f"{CHAT_VIEW_NAME} {index}"
 
 
 def set_input_start(view, pos):
@@ -127,14 +241,15 @@ def update_agent_model_status(window, view=None):
     show_status = settings.get("show_status_indicator", True)
 
     status = None
-    if show_status and window.id() in chatview_clients:
-        agent_provider = window.settings().get(CHAT_AGENT, "claude") or "claude"
-        model = window.settings().get(f"chatview_model_{agent_provider}") or "default"
+    target_chat = _target_chat_view(window)
+    session = _session_for_view(target_chat) if target_chat is not None else None
+    if show_status and session is not None:
+        agent_provider = _chat_setting(target_chat, CHAT_AGENT, "claude") or "claude"
+        model = _chat_setting(target_chat, f"chatview_model_{agent_provider}") or "default"
         display_model = format_model_display_name(agent_provider, model)
 
-        session = chatview_clients.get(window.id())
-        think_level = window.settings().get(f"chatview_think_level_{agent_provider}")
-        if think_level and session and any(m.get("value") == model and m.get("annotation") for m in session.available_models):
+        think_level = _chat_setting(target_chat, f"chatview_think_level_{agent_provider}")
+        if think_level and any(m.get("value") == model and m.get("annotation") for m in session.available_models):
             display_model = f"{display_model} :{think_level}"
 
         status = f"▣ {agent_provider}({display_model})"
@@ -187,9 +302,9 @@ def plugin_unloaded():
     """
     _unwatch_preferences()
 
-    for window_id, session in list(chatview_clients.items()):
+    for view_id, session in list(chatview_clients.items()):
         try:
-            LOG.info(f"Stopping ChatView session for window {window_id} on unload")
+            LOG.info(f"Stopping ChatView session for view {view_id} on unload")
             agent_thread = getattr(session, "agent_thread", None)
             agent = agent_thread.agent if agent_thread else None
             if isinstance(agent, OpenCodeAgent):
@@ -236,11 +351,11 @@ def _refresh_input_phantoms():
     global preferences_redraw_scheduled
 
     try:
-        for window_id, session in list(chatview_clients.items()):
+        for view_id, session in list(chatview_clients.items()):
             session.model_phantom.update()
             session.input_marker.update()
             session.table_phantoms.refresh()
-            LOG.debug(f"Redrew chat view input phantoms for window {window_id}")
+            LOG.debug(f"Redrew chat view input phantoms for view {view_id}")
     finally:
         preferences_redraw_scheduled = False
 
@@ -250,7 +365,7 @@ def _restore_chat_sessions():
     for window in sublime.windows():
         for view in window.views():
             if (view.settings().get(CHAT_VIEW_FLAG, False) and
-                    window.id() not in chatview_clients):
+                    view.id() not in chatview_clients):
                 _reconnect_chat_view(view)
 
 
@@ -262,8 +377,7 @@ def _reconnect_chat_view(view):
     window = view.window()
     if not window:
         return
-    window_id = window.id()
-    if window_id in chatview_clients:
+    if view.id() in chatview_clients:
         return
 
     settings = sublime.load_settings(f"{PACKAGE_NAME}.sublime-settings")
@@ -277,14 +391,14 @@ def _reconnect_chat_view(view):
     view.settings().set("draw_unicode_white_space", "none")
 
     session = ChatSession(window, view, cwd, add_dirs=add_dirs, session_id=session_id)
-    chatview_clients[window_id] = session
+    chatview_clients[view.id()] = session
     update_agent_model_status(window)
     # Restore the input phantoms at the existing CHAT_INPUT_START position
     session.notice_phantom.show("conversation restored after restart")
     session.model_phantom.update()
     # Scroll after phantom layout so the restored view reaches the end.
     sublime.set_timeout(lambda: view.show(view.size()), 0)
-    LOG.info(f"Reconnected ChatView agent for window {window_id}, cwd={cwd}, add_dirs={add_dirs}, session_id={session_id}")
+    LOG.info(f"Reconnected ChatView agent for view {view.id()}, cwd={cwd}, add_dirs={add_dirs}, session_id={session_id}")
 
 
 def get_all_folders(view):
@@ -297,8 +411,8 @@ def get_all_folders(view):
 def get_best_dir(view):
     window = view.window()
     if window:
-        # Check for explicitly set workspace
-        custom_cwd = window.settings().get(CHAT_WORKSPACE)
+        # Check for explicitly set workspace (per-chat first, then window)
+        custom_cwd = _chat_setting(view, CHAT_WORKSPACE)
         if custom_cwd and os.path.isdir(custom_cwd):
             return custom_cwd
 
@@ -726,6 +840,8 @@ class ModelPanel:
 
     def _on_navigate(self, href):
         """Handle actions from links in the model panel."""
+        # Focus this chat view first so the window command resolves to THIS chat.
+        self.window.focus_view(self.view)
         if href == "set_agent":
             self.window.run_command("term_chat_set_agent")
         elif href == "set_model":
@@ -749,7 +865,7 @@ class ModelPanel:
 
     def update(self):
         """Update the model phantom display."""
-        plan_mode_value = self.window.settings().get(CHAT_PLAN_MODE, PlanMode.FAST.value)
+        plan_mode_value = _chat_setting(self.view, CHAT_PLAN_MODE, PlanMode.FAST.value)
         try:
             plan_mode = PlanMode(plan_mode_value)
         except ValueError:
@@ -758,10 +874,10 @@ class ModelPanel:
         input_start = get_input_start(self.view)
         region = sublime.Region(input_start, input_start)
 
-        agent_provider = self.window.settings().get(CHAT_AGENT, "claude")
-        model = self.window.settings().get(f"chatview_model_{agent_provider}") or "default"
+        agent_provider = _chat_setting(self.view, CHAT_AGENT, "claude")
+        model = _chat_setting(self.view, f"chatview_model_{agent_provider}") or "default"
         # Keep the display key in sync
-        self.window.settings().set(CHAT_MODEL, model)
+        _set_chat_setting(self.view, CHAT_MODEL, model)
 
         display_model = format_model_display_name(agent_provider, model)
 
@@ -1331,12 +1447,12 @@ class ChatSession:
             self.window.run_command("term_chat_install_agent")
             return
 
-        # Determine agent provider early
-        agent_provider = self.window.settings().get(CHAT_AGENT, settings.get("agent_provider", "claude"))
+        # Determine agent provider early (per-chat, falling back to window defaults)
+        agent_provider = _chat_setting(self.chat_view, CHAT_AGENT, settings.get("agent_provider", "claude"))
 
         if agent_provider not in self.available_agents:
             agent_provider = self.available_agents[0]
-            self.window.settings().set(CHAT_AGENT, agent_provider)
+            _set_chat_setting(self.chat_view, CHAT_AGENT, agent_provider)
 
         self.message_processor = BaseChatMessageProcessor.for_provider(agent_provider)(self)
 
@@ -1346,19 +1462,19 @@ class ChatSession:
             cli_path = None  # Let the agent class find its own CLI
 
         # Use provider-specific model key so switching agents won't carry over incompatible models
-        model = self.window.settings().get(f"chatview_model_{agent_provider}") or None
-        think_level = self.window.settings().get(f"chatview_think_level_{agent_provider}") or None
+        model = _chat_setting(self.chat_view, f"chatview_model_{agent_provider}") or None
+        think_level = _chat_setting(self.chat_view, f"chatview_think_level_{agent_provider}") or None
 
         disallowed_tools = self._get_disallowed_tools(settings)
 
         anthropic_config = {
             "model": model,
             "think_level": think_level,
-            "plan_mode": self.window.settings().get(CHAT_PLAN_MODE) == PlanMode.PLANNING.value,
+            "plan_mode": _chat_setting(self.chat_view, CHAT_PLAN_MODE) == PlanMode.PLANNING.value,
             "allowed_tools": settings.get("allowed_tools"),
             "disallowed_tools": disallowed_tools,
             "agent_provider": agent_provider,
-            "approve_mode": self.window.settings().get(CHAT_APPROVE_MODE, ApproveMode.ALLOW_EDIT.value),
+            "approve_mode": _chat_setting(self.chat_view, CHAT_APPROVE_MODE, ApproveMode.ALLOW_EDIT.value),
             "session_id": session_id,
             "env": settings.get("env", {}),
             "debug_agent_message": settings.get("debug_agent_message", False),
@@ -1454,9 +1570,9 @@ class ChatSession:
 
     def _get_sandbox_mode(self, settings, agent_provider):
         """Determine sandbox_mode preference for the given provider."""
-        sandbox_mode = self.window.settings().get(f"chatview_sandbox_mode_{agent_provider}")
+        sandbox_mode = _chat_setting(self.chat_view, f"chatview_sandbox_mode_{agent_provider}")
         if sandbox_mode is None:
-            sandbox_mode = self.window.settings().get("chatview_sandbox_mode")
+            sandbox_mode = _chat_setting(self.chat_view, "chatview_sandbox_mode")
         if sandbox_mode is None:
             sandbox_mode = settings.get("sandbox_mode", True)
         return sandbox_mode
@@ -1471,7 +1587,7 @@ class ChatSession:
             self._auto_approve(request_id, input_data)
             return
 
-        approve_mode = self.window.settings().get(CHAT_APPROVE_MODE, ApproveMode.ALLOW_EDIT.value)
+        approve_mode = _chat_setting(self.chat_view, CHAT_APPROVE_MODE, ApproveMode.ALLOW_EDIT.value)
 
         always_confirm_tools = ("ExitPlanMode",)
         if tool_name in always_confirm_tools:
@@ -1638,7 +1754,7 @@ class ChatSession:
 
     @property
     def plan_mode(self):
-        val = self.window.settings().get(CHAT_PLAN_MODE, PlanMode.FAST.value)
+        val = _chat_setting(self.chat_view, CHAT_PLAN_MODE, PlanMode.FAST.value)
         try:
             return PlanMode(val)
         except ValueError:
@@ -1647,9 +1763,9 @@ class ChatSession:
     @plan_mode.setter
     def plan_mode(self, value):
         if isinstance(value, PlanMode):
-            self.window.settings().set(CHAT_PLAN_MODE, value.value)
+            _set_chat_setting(self.chat_view, CHAT_PLAN_MODE, value.value)
         else:
-            self.window.settings().set(CHAT_PLAN_MODE, value)
+            _set_chat_setting(self.chat_view, CHAT_PLAN_MODE, value)
 
     def send_input(self, user_input, region=None):
         """Start animation and send to agent."""
@@ -1897,19 +2013,19 @@ class ChatSession:
             return
 
         cli_path = settings.get(f"{new_agent_provider}_command") or None
-        model = self.window.settings().get(f"chatview_model_{new_agent_provider}") or None
-        think_level = self.window.settings().get(f"chatview_think_level_{new_agent_provider}") or None
+        model = _chat_setting(self.chat_view, f"chatview_model_{new_agent_provider}") or None
+        think_level = _chat_setting(self.chat_view, f"chatview_think_level_{new_agent_provider}") or None
 
         disallowed_tools = self._get_disallowed_tools(settings)
 
         anthropic_config = {
             "model": model,
             "think_level": think_level,
-            "plan_mode": self.window.settings().get(CHAT_PLAN_MODE) == PlanMode.PLANNING.value,
+            "plan_mode": _chat_setting(self.chat_view, CHAT_PLAN_MODE) == PlanMode.PLANNING.value,
             "allowed_tools": settings.get("allowed_tools"),
             "disallowed_tools": disallowed_tools,
             "agent_provider": new_agent_provider,
-            "approve_mode": self.window.settings().get(CHAT_APPROVE_MODE, ApproveMode.ALLOW_EDIT.value),
+            "approve_mode": _chat_setting(self.chat_view, CHAT_APPROVE_MODE, ApproveMode.ALLOW_EDIT.value),
             "env": settings.get("env", {}),
             "debug_agent_message": settings.get("debug_agent_message", False),
             "sandbox_mode": self._get_sandbox_mode(settings, new_agent_provider),
@@ -1941,7 +2057,7 @@ class ChatSession:
         else:
             old_session_id = None
 
-        current_agent_provider = self.window.settings().get(CHAT_AGENT, "claude")
+        current_agent_provider = _chat_setting(self.chat_view, CHAT_AGENT, "claude")
 
         if self.agent_thread:
             self.agent_thread.stop()
@@ -1955,8 +2071,8 @@ class ChatSession:
             return
 
         cli_path = settings.get(f"{current_agent_provider}_command") or None
-        model = self.window.settings().get(f"chatview_model_{current_agent_provider}") or None
-        think_level = self.window.settings().get(f"chatview_think_level_{current_agent_provider}") or None
+        model = _chat_setting(self.chat_view, f"chatview_model_{current_agent_provider}") or None
+        think_level = _chat_setting(self.chat_view, f"chatview_think_level_{current_agent_provider}") or None
 
         if plan_mode is None:
             plan_mode = self.plan_mode
@@ -1970,7 +2086,7 @@ class ChatSession:
             "allowed_tools": settings.get("allowed_tools"),
             "disallowed_tools": disallowed_tools,
             "agent_provider": current_agent_provider,
-            "approve_mode": self.window.settings().get(CHAT_APPROVE_MODE, ApproveMode.ALLOW_EDIT.value),
+            "approve_mode": _chat_setting(self.chat_view, CHAT_APPROVE_MODE, ApproveMode.ALLOW_EDIT.value),
             "session_id": old_session_id,
             "env": settings.get("env", {}),
             "debug_agent_message": settings.get("debug_agent_message", False),
@@ -2087,70 +2203,97 @@ class ChatSession:
         LOG.info(f"Dynamically updated plan mode to: {plan_mode}")
 
 
+def _open_chat_view(window, initial_msg="", send_immediate=False):
+    """Create a new chat view in the window, wire up its ChatSession and focus it.
+
+    Every call creates an additional, independent chat — callers that want
+    focus-or-create semantics must check for an existing chat view first.
+    Returns the new chat view.
+    """
+    chat_view = window.new_file()
+    chat_view.set_name(_next_chat_name(window))
+    chat_view.set_scratch(True)
+    chat_view.set_syntax_file(f"Packages/{PACKAGE_NAME}/chatview/ChatMD.sublime-syntax")
+
+    chat_view.settings().set("draw_minimap", False)
+    chat_view.settings().set("line_numbers", False)
+    chat_view.settings().set("word_wrap", True)
+    # Needed so the file-changes artifact can be expanded via the gutter
+    chat_view.settings().set("fold_buttons", True)
+    # Don't draw the NBSP fold terminator appended after the artifact list
+    chat_view.settings().set("draw_unicode_white_space", "none")
+    chat_view.settings().set(CHAT_VIEW_FLAG, True)
+    # Seed per-chat settings (agent, model, plan mode, ...) from the window
+    _inherit_chat_settings(chat_view)
+
+    shortcut = "Command+Enter" if sublime.platform() == "osx" else "Ctrl+Enter"
+    welcome_text = "\nType your message and press %s to send.\n" % shortcut
+
+    chat_view.run_command("append", {"characters": f"Starting {PACKAGE_NAME} agent\n"})
+
+    settings = sublime.load_settings(f"{PACKAGE_NAME}.sublime-settings")
+    share_folders = settings.get("share_workspace_folders", False)
+
+    cwd = get_best_dir(chat_view)
+    add_dirs = get_all_folders(chat_view) if share_folders else []
+
+    if cwd:
+        chat_view.run_command("append", {"characters": f"cwd: {cwd}\n"})
+
+    chat_view.run_command("append", {"characters": welcome_text})
+
+    # Set input start position
+    set_input_start(chat_view, chat_view.size())
+
+    # Create and start the ChatSession
+    session = ChatSession(window, chat_view, cwd, add_dirs=add_dirs)
+    chatview_clients[chat_view.id()] = session
+    update_agent_model_status(window)
+
+    # With a dedicated chat pane, land the new chat next to the existing ones
+    if settings.get("dedicated_chat_pane", True) and window.num_groups() > 1:
+        for group in range(window.num_groups()):
+            if any(v is not chat_view and v.settings().get(CHAT_VIEW_FLAG, False)
+                   for v in window.views_in_group(group)):
+                window.set_view_index(chat_view, group, len(window.views_in_group(group)))
+                break
+
+    # Show initial prompt (this will also update the model phantom)
+    chat_view.run_command("term_chat_input_prompt", {"text": initial_msg})
+    if initial_msg and send_immediate:
+        chat_view.run_command("term_chat_send_input")
+    window.focus_view(chat_view)
+    return chat_view
+
+
 class TermChatCliCommand(sublime_plugin.WindowCommand):
     """
     A Sublime Text plugin command for calling the ChatView
     """
     def run(self, initial_msg="", send_immediate=False):
-        # Try to find and focus existing chat view
-        for view in self.window.views():
-            if view.settings().get(CHAT_VIEW_FLAG, False):
-                self.window.focus_view(view)
-                # Reconnect if session was lost (e.g., after a restart)
-                if self.window.id() not in chatview_clients:
-                    _reconnect_chat_view(view)
-                if initial_msg:
-                    view.run_command("term_chat_input_prompt", {"text": initial_msg})
-                    if send_immediate:
-                        view.run_command("term_chat_send_input")
-                self.window.focus_view(view)
-                return
+        # Focus the target chat view if one already exists
+        view = _target_chat_view(self.window)
+        if view is not None:
+            self.window.focus_view(view)
+            # Reconnect if session was lost (e.g., after a restart)
+            if view.id() not in chatview_clients:
+                _reconnect_chat_view(view)
+            if initial_msg:
+                view.run_command("term_chat_input_prompt", {"text": initial_msg})
+                if send_immediate:
+                    view.run_command("term_chat_send_input")
+            self.window.focus_view(view)
+            return
 
-        # Create a new view
-        chat_view = self.window.new_file()
-        chat_view.set_name(CHAT_VIEW_NAME)
-        chat_view.set_scratch(True)
-        chat_view.set_syntax_file(f"Packages/{PACKAGE_NAME}/chatview/ChatMD.sublime-syntax")
+        _open_chat_view(self.window, initial_msg, send_immediate)
 
-        chat_view.settings().set("draw_minimap", False)
-        chat_view.settings().set("line_numbers", False)
-        chat_view.settings().set("word_wrap", True)
-        # Needed so the file-changes artifact can be expanded via the gutter
-        chat_view.settings().set("fold_buttons", True)
-        # Don't draw the NBSP fold terminator appended after the artifact list
-        chat_view.settings().set("draw_unicode_white_space", "none")
-        chat_view.settings().set(CHAT_VIEW_FLAG, True)
 
-        shortcut = "Command+Enter" if sublime.platform() == "osx" else "Ctrl+Enter"
-        welcome_text = "\nType your message and press %s to send.\n" % shortcut
-
-        chat_view.run_command("append", {"characters": f"Starting {PACKAGE_NAME} agent\n"})
-
-        settings = sublime.load_settings(f"{PACKAGE_NAME}.sublime-settings")
-        share_folders = settings.get("share_workspace_folders", False)
-
-        cwd = get_best_dir(chat_view)
-        add_dirs = get_all_folders(chat_view) if share_folders else []
-
-        if cwd:
-            chat_view.run_command("append", {"characters": f"cwd: {cwd}\n"})
-
-        chat_view.run_command("append", {"characters": welcome_text})
-
-        # Set input start position
-        set_input_start(chat_view, chat_view.size())
-
-        # Create and start the ChatSession
-        session = ChatSession(self.window, chat_view, cwd, add_dirs=add_dirs)
-        window_id = self.window.id()
-        chatview_clients[window_id] = session
-        update_agent_model_status(self.window)
-
-        # Show initial prompt (this will also update the model phantom)
-        chat_view.run_command("term_chat_input_prompt", {"text": initial_msg})
-        if initial_msg and send_immediate:
-            chat_view.run_command("term_chat_send_input")
-        self.window.focus_view(chat_view)
+class TermChatNewChatCommand(sublime_plugin.WindowCommand):
+    """
+    Always open an additional, independent chat view in the current window.
+    """
+    def run(self, initial_msg="", send_immediate=False):
+        _open_chat_view(self.window, initial_msg, send_immediate)
 
 
 class TermChatSplitChatCommand(sublime_plugin.WindowCommand):
@@ -2180,23 +2323,20 @@ class TermChatSplitChatCommand(sublime_plugin.WindowCommand):
             group, index = int(group), int(index)
         except (TypeError, ValueError):
             group, index = -1, -1
-        # Try to find existing chat view
-        chat_view = None
-        for view in self.window.views():
-            if view.settings().get(CHAT_VIEW_FLAG, False):
-                chat_view = view
-                break
-        
-        if chat_view:
-            self._split_and_move(chat_view)
+        # Collect all chat views in the window
+        chat_views = _chat_views_in_window(self.window)
+
+        if chat_views:
+            self._split_and_move(chat_views)
         else:
             sublime.status_message(f"No active {PACKAGE_NAME} found to split")
 
-    def _split_and_move(self, view):
+    def _split_and_move(self, views):
         window = self.window
         layout = window.get_layout()
         cols = layout.get("cols", [0.0, 1.0])
-        
+        chat_ids = {v.id() for v in views}
+
         if len(cols) < 3:
             # It's a single column layout. Let's split it into two columns with equal width.
             window.set_layout({
@@ -2204,19 +2344,19 @@ class TermChatSplitChatCommand(sublime_plugin.WindowCommand):
                 "rows": [0.0, 1.0],
                 "cells": [[0, 0, 1, 1], [1, 0, 2, 1]]
             })
-            
+
             # Since we just split, all existing views are in group 0.
-            # Move all views EXCEPT the chat view to group 1 (right side).
+            # Move all views EXCEPT the chat views to group 1 (right side).
             for v in list(window.views_in_group(0)):
-                if v.id() != view.id():
+                if v.id() not in chat_ids:
                     window.set_view_index(v, 1, 0)
-            
-            
-        # Ensure the chat view is in the left-most group (group 0)
-        window.set_view_index(view, 0, 0)
-        # Focus the chat view
+
+        # Ensure every chat view is in the left-most group (group 0)
+        for view in views:
+            window.set_view_index(view, 0, len(window.views_in_group(0)))
+        # Focus the first chat view
         window.focus_group(0)
-        window.focus_view(view)
+        window.focus_view(views[0])
 
 
 class TermChatSendInputCommand(sublime_plugin.TextCommand):
@@ -2228,8 +2368,8 @@ class TermChatSendInputCommand(sublime_plugin.TextCommand):
         if not window:
             return
 
-        window_id = window.id()
-        if window_id not in chatview_clients:
+        session = _session_for_view(self.view)
+        if session is None:
             sublime.status_message(f"No active {PACKAGE_NAME} session found")
             return
 
@@ -2253,7 +2393,6 @@ class TermChatSendInputCommand(sublime_plugin.TextCommand):
         self.view.run_command("term_chat_input_prompt", {"text": ""})
 
         # Send to session
-        session = chatview_clients[window_id]
         session.history.append(user_input)
         session.history_index = len(session.history)
         session.history_stash = ""
@@ -2263,11 +2402,10 @@ class TermChatSendInputCommand(sublime_plugin.TextCommand):
 
 class TermChatHistoryUpCommand(sublime_plugin.TextCommand):
     def run(self, edit):
-        window = self.view.window()
-        if not window or window.id() not in chatview_clients:
+        session = _session_for_view(self.view)
+        if session is None:
             return
 
-        session = chatview_clients[window.id()]
         editable_start = input_editable_start(self.view)
 
         # History navigation
@@ -2290,11 +2428,9 @@ class TermChatHistoryUpCommand(sublime_plugin.TextCommand):
 
 class TermChatHistoryDownCommand(sublime_plugin.TextCommand):
     def run(self, edit):
-        window = self.view.window()
-        if not window or window.id() not in chatview_clients:
+        session = _session_for_view(self.view)
+        if session is None:
             return
-
-        session = chatview_clients[window.id()]
 
         # History navigation
         if session.history_index < len(session.history):
@@ -2326,7 +2462,7 @@ class ChatViewListener(sublime_plugin.EventListener):
 
         # reconnect restored chat view
         if view.settings().get(CHAT_VIEW_FLAG, False):
-            if window.id() not in chatview_clients:
+            if view.id() not in chatview_clients:
                 sublime.set_timeout(lambda: _reconnect_chat_view(view), 100)
             return
 
@@ -2335,7 +2471,7 @@ class ChatViewListener(sublime_plugin.EventListener):
         if not settings.get("dedicated_chat_pane", True):
             return
 
-        if window.num_groups() <= 1 or window.id() not in chatview_clients:
+        if window.num_groups() <= 1 or not _chat_views_in_window(window):
             return
 
         # Ignore widgets like the console or input panels
@@ -2357,35 +2493,40 @@ class ChatViewListener(sublime_plugin.EventListener):
                 break
 
     def on_activated(self, view):
-        update_agent_model_status(view.window(), view)
+        window = view.window()
+        if window is not None and view.settings().get(CHAT_VIEW_FLAG, False):
+            _last_active_chat[window.id()] = view.id()
+        update_agent_model_status(window, view)
 
     def on_close(self, view):
         """
-        Cleanup session when the chat view is closed.
+        Cleanup the session of the chat view being closed; other chats in the
+        same window keep running.
         """
-        if view.name() == CHAT_VIEW_NAME:
-            window = view.window()
-            if window is None:
-                window = sublime.active_window()
+        if not view.settings().get(CHAT_VIEW_FLAG, False):
+            return
 
+        session = chatview_clients.pop(view.id(), None)
+        window = view.window()
+        if window is not None and _last_active_chat.get(window.id()) == view.id():
+            _last_active_chat.pop(window.id(), None)
+
+        if session is not None:
+            try:
+                session.stop()
+            except Exception:
+                pass
             if window is not None:
-                window_id = window.id()
-                if window_id in chatview_clients:
-                    try:
-                        chatview_clients[window_id].stop()
-                    except Exception:
-                        pass
-                    del chatview_clients[window_id]
-                    update_agent_model_status(window)
-                    LOG.info(f"Exit ChatView CLI for window {window_id}")
-            LOG.info("ChatView closed")
+                update_agent_model_status(window)
+            LOG.info(f"Exit ChatView CLI for view {view.id()}")
+        LOG.info("ChatView closed")
 
     def on_selection_modified(self, view):
         """
         Restrict cursor movement to the editable area.
         Allows selecting history for copy, but prevents placing the caret in history.
         """
-        if not view.settings().get(CHAT_VIEW_FLAG, False) and view.name() != CHAT_VIEW_NAME:
+        if not view.settings().get(CHAT_VIEW_FLAG, False):
             return
         if not view.settings().has(CHAT_INPUT_START):
             return
@@ -2433,7 +2574,7 @@ class ChatViewListener(sublime_plugin.EventListener):
                     return ("noop", {})
 
         # Only monitor ChatView chat views
-        if not view.settings().get(CHAT_VIEW_FLAG, False) and view.name() != CHAT_VIEW_NAME:
+        if not view.settings().get(CHAT_VIEW_FLAG, False):
             return None
 
         # Double-click on a tool call file line → open the file instead of selecting the word
@@ -2444,8 +2585,8 @@ class ChatViewListener(sublime_plugin.EventListener):
                 and not args.get("additive", False)):
             is_word_select = (args.get("by") == "words")
             window = view.window()
-            if window and window.id() in chatview_clients:
-                session = chatview_clients[window.id()]
+            session = _session_for_view(view)
+            if window and session is not None:
                 point = args.get("event", {}).get("x"), args.get("event", {}).get("y")
                 click_point = (
                     view.window_to_text((point[0], point[1]))
@@ -2553,10 +2694,9 @@ class ChatViewListener(sublime_plugin.EventListener):
             return
         if not view.settings().get(CHAT_VIEW_FLAG, False):
             return
-        window = view.window()
-        if not window or window.id() not in chatview_clients:
+        session = _session_for_view(view)
+        if session is None:
             return
-        session = chatview_clients[window.id()]
 
         row, _ = view.rowcol(point)
         for i, (region, uuid, _) in enumerate(session.prompt_regions):
@@ -2626,9 +2766,9 @@ class TermChatRewindTruncateCommand(sublime_plugin.TextCommand):
         self.view.insert(edit, self.view.size(), "\n\n")
         set_input_start(self.view, self.view.size() - 1)
 
-        window = self.view.window()
-        if window and window.id() in chatview_clients:
-            chatview_clients[window.id()].model_phantom.update()
+        session = _session_for_view(self.view)
+        if session is not None:
+            session.model_phantom.update()
 
         if rewind_text:
             self.view.insert(edit, self.view.size(), rewind_text)
@@ -2637,8 +2777,8 @@ class TermChatRewindTruncateCommand(sublime_plugin.TextCommand):
         self.view.sel().add(sublime.Region(end))
         self.view.show(end)
 
-        if window and window.id() in chatview_clients:
-            chatview_clients[window.id()].input_marker.update()
+        if session is not None:
+            session.input_marker.update()
 
 
 class TermChatOutputAppendCommand(sublime_plugin.TextCommand):
@@ -2650,8 +2790,7 @@ class TermChatOutputAppendCommand(sublime_plugin.TextCommand):
         # settings value in sync (and re-anchor if the anchor was missing).
         set_input_start(self.view, insert_at + inserted + 1)
         if html_tables:
-            window = self.view.window()
-            session = (chatview_clients.get(window.id()) if window else None)
+            session = _session_for_view(self.view)
             if session:
                 for table in html_tables:
                     start = insert_at + table["start"]
@@ -2680,9 +2819,9 @@ class TermChatInputPromptCommand(sublime_plugin.TextCommand):
         set_input_start(self.view, self.view.size() - 1)
 
         # Update model phantom at new position
-        window = self.view.window()
-        if window and window.id() in chatview_clients:
-            session = chatview_clients[window.id()]
+        session = _session_for_view(self.view)
+
+        if session is not None:
             session.model_phantom.update()
 
         # Next input prompt (the ❯ itself is the InputPromptMarker phantom)
@@ -2692,8 +2831,8 @@ class TermChatInputPromptCommand(sublime_plugin.TextCommand):
         self.view.sel().clear()
         self.view.sel().add(sublime.Region(end))
 
-        if window and window.id() in chatview_clients:
-            chatview_clients[window.id()].input_marker.update()
+        if session is not None:
+            session.input_marker.update()
 
         # Scroll after the input marker have been laid out.
         sublime.set_timeout(lambda: self.view.show(self.view.size()), 0)
@@ -2749,11 +2888,7 @@ class TermChatAddContextCommand(sublime_plugin.WindowCommand):
                 tags = ""
                 insert_text = ""
 
-        chat_view = None
-        for v in self.window.views():
-            if v.settings().get(CHAT_VIEW_FLAG, False):
-                chat_view = v
-                break
+        chat_view = _target_chat_view(self.window)
 
         if not chat_view:
             self.window.run_command("term_chat_cli", {"initial_msg": tags})
@@ -2866,12 +3001,8 @@ class TermChatPromptCommand(sublime_plugin.WindowCommand):
         if missing_tags:
             prompt = " ".join(missing_tags + [prompt])
 
-        # Try to find existing chat view
-        chat_view = None
-        for v in self.window.views():
-            if v.settings().get(CHAT_VIEW_FLAG, False):
-                chat_view = v
-                break
+        # Route to the target (most recently active) chat view
+        chat_view = _target_chat_view(self.window)
 
         if chat_view:
             # Snap the selection out of the history area before inserting
@@ -2886,10 +3017,7 @@ class TermChatPromptCommand(sublime_plugin.WindowCommand):
                 "initial_msg": prompt,
                 "send_immediate": True
             })
-            for view in self.window.views():
-                if view.settings().get(CHAT_VIEW_FLAG, False):
-                    chat_view = view
-                    break
+            chat_view = _target_chat_view(self.window)
 
         self._apply_post_submit_focus(chat_view, source_view)
 
@@ -2963,7 +3091,11 @@ class TermChatSetWorkspaceCommand(sublime_plugin.WindowCommand):
                     break
 
         if target_dir:
-            self.window.settings().set(CHAT_WORKSPACE, target_dir)
+            chat_view = _target_chat_view(self.window)
+            if chat_view is not None:
+                _set_chat_setting(chat_view, CHAT_WORKSPACE, target_dir)
+            else:
+                self.window.settings().set(CHAT_WORKSPACE, target_dir)
             sublime.status_message(f"ChatView Dir set to: {target_dir}")
         else:
             sublime.status_message(f"No valid directory for {PACKAGE_NAME} Workspace")
@@ -2979,20 +3111,19 @@ class TermChatClearSessionCommand(sublime_plugin.WindowCommand):
     This resets the conversation history similar to Claude Code's reset session.
     """
     def run(self):
-        window_id = self.window.id()
-        if window_id not in chatview_clients:
+        session = _session_for_window(self.window)
+        if session is None:
             sublime.status_message("No active ChatView session found")
             return
 
         # Reset the session (disconnect and reconnect agent)
-        session = chatview_clients[window_id]
         session.reset_session()
         sublime.status_message("Resetting chat session...")
         LOG.info("Resetting chat session via disconnect/reconnect")
 
     def is_enabled(self):
         # Only enable if there's an active session
-        return self.window.id() in chatview_clients
+        return _session_for_window(self.window) is not None
 
 
 class TermChatResumeSessionCommand(sublime_plugin.WindowCommand):
@@ -3016,13 +3147,12 @@ class TermChatResumeSessionCommand(sublime_plugin.WindowCommand):
 
     def _get_agent(self, session):
         if session is not None:
-            return session.window.settings().get(CHAT_AGENT, "claude")
+            return _chat_setting(session.chat_view, CHAT_AGENT, "claude")
         return self.window.settings().get(CHAT_AGENT, "claude")
 
     def run(self):
         import datetime
-        window_id = self.window.id()
-        session = chatview_clients.get(window_id)
+        session = _session_for_window(self.window)
         agent = self._get_agent(session)
         cwd = self._get_cwd(session)
         settings = sublime.load_settings(f"{PACKAGE_NAME}.sublime-settings")
@@ -3055,6 +3185,15 @@ class TermChatResumeSessionCommand(sublime_plugin.WindowCommand):
 
         current_session_id = session.agent_thread.session_id if session and session.agent_thread else None
 
+        # Mark every session currently live in one of this window's chat views
+        active_session_ids = set()
+        for chat_view in _chat_views_in_window(self.window):
+            chat_session = _session_for_view(chat_view)
+            if chat_session and chat_session.agent_thread:
+                sid = chat_session.agent_thread.session_id
+                if sid:
+                    active_session_ids.add(sid)
+
         items = []
         for s in sessions:
             sid = s["session_id"]
@@ -3062,8 +3201,21 @@ class TermChatResumeSessionCommand(sublime_plugin.WindowCommand):
             if len(summary) > self._PREVIEW_LEN:
                 summary = summary[:self._PREVIEW_LEN] + "…"
             dt = datetime.datetime.fromtimestamp(s["mtime"]).strftime("%Y-%m-%d %H:%M")
-            marker = "  ●" if sid == current_session_id else ""
+            marker = "  ●" if sid in active_session_ids else ""
             items.append([summary, f"{sid[:8]}  {dt}{marker}"])
+
+        def _resume_into(target_session, chosen_id):
+            target_session.chat_view.settings().set(CHAT_SESSION_ID, chosen_id)
+            target_session.has_sent_message = True
+            target_session.reload_agent(session_id_override=chosen_id, quiet=False)
+
+        def _resume_in_new_chat(chosen_id):
+            chat_view = _open_chat_view(self.window)
+            new_session = _session_for_view(chat_view)
+            if new_session is None:
+                LOG.warning("[resume] chat view not ready after _open_chat_view")
+                return
+            _resume_into(new_session, chosen_id)
 
         def on_select(index):
             if index < 0:
@@ -3074,31 +3226,33 @@ class TermChatResumeSessionCommand(sublime_plugin.WindowCommand):
                 sublime.status_message("Already on that session")
                 return
 
-            active_session = chatview_clients.get(window_id)
-            if active_session is not None:
-                active_session.chat_view.settings().set(CHAT_SESSION_ID, chosen_id)
-                active_session.has_sent_message = True
-                active_session.reload_agent(session_id_override=chosen_id, quiet=False)
-            else:
-                self.window.run_command("term_chat_cli")
+            active_session = _session_for_window(self.window)
+            if active_session is None:
+                _resume_in_new_chat(chosen_id)
+                sublime.status_message(f"Resuming session {chosen_id[:8]}…")
+                return
 
-                def _resume_after_open():
-                    new_session = chatview_clients.get(window_id)
-                    if new_session is None:
-                        LOG.warning("[resume] chat view not ready after term_chat_cli")
-                        return
-                    new_session.chat_view.settings().set(CHAT_SESSION_ID, chosen_id)
-                    new_session.has_sent_message = True
-                    new_session.reload_agent(session_id_override=chosen_id, quiet=False)
+            # A chat is already open: let the user choose between replacing it
+            # and opening the session in an additional chat view.
+            def on_destination(dest_index):
+                if dest_index < 0:
+                    return
+                if dest_index == 0:
+                    _resume_in_new_chat(chosen_id)
+                else:
+                    _resume_into(_session_for_window(self.window), chosen_id)
+                sublime.status_message(f"Resuming session {chosen_id[:8]}…")
 
-                sublime.set_timeout(_resume_after_open, 0)
-
-            sublime.status_message(f"Resuming session {chosen_id[:8]}…")
+            self.window.show_quick_panel(
+                ["Open in new chat", "Replace current chat"],
+                on_destination,
+                placeholder=f"Resume {chosen_id[:8]} — where?",
+            )
 
         self.window.show_quick_panel(items, on_select, placeholder=placeholder)
 
     def is_enabled(self):
-        session = chatview_clients.get(self.window.id())
+        session = _session_for_window(self.window)
         agent = self._get_agent(session)
         return agent in ("claude", "codex", "pi", "opencode", "antigravity")
 
@@ -3108,12 +3262,11 @@ class TermChatInterruptCommand(sublime_plugin.WindowCommand):
     Interrupts the current chat session.
     """
     def run(self, confirm=False):
-        window_id = self.window.id()
-        if window_id not in chatview_clients:
+        session = _session_for_window(self.window)
+        if session is None:
             sublime.status_message("No active ChatView session found")
             return
 
-        session = chatview_clients[window_id]
         if not session.loading_animation.is_loading:
             sublime.status_message("No active conversation to interrupt")
             return
@@ -3139,14 +3292,14 @@ class TermChatInterruptCommand(sublime_plugin.WindowCommand):
                     1000
                 )
                 sublime.status_message("Interrupting agent")
-                LOG.info(f"Interrupt conversation for window {window_id}")
+                LOG.info(f"Interrupt conversation for view {session.chat_view.id()}")
             except Exception as e:
                 session.model_phantom.set_stopping(False)
                 LOG.error(f"Failed to interrupt agent: {e}")
 
     def is_enabled(self):
         # Only enable if there's an active session
-        return self.window.id() in chatview_clients
+        return _session_for_window(self.window) is not None
 
 
 class TermChatSetModelListHandler(sublime_plugin.ListInputHandler):
@@ -3164,17 +3317,17 @@ class TermChatSetModelListHandler(sublime_plugin.ListInputHandler):
             return None
 
         window = self.window or sublime.active_window()
-        agent_provider = window.settings().get(CHAT_AGENT, "claude") if window else "claude"
+        chat_view = _target_chat_view(window) if window else None
+        session = _session_for_view(chat_view)
+        agent_provider = _chat_setting(chat_view, CHAT_AGENT, "claude") if chat_view is not None else "claude"
 
         active_model = {}
-        if window and window.id() in chatview_clients:
-            session = chatview_clients[window.id()]
-            if session and session.available_models:
-                active_model = next((m for m in session.available_models if m.get("value") == model), {})
+        if session and session.available_models:
+            active_model = next((m for m in session.available_models if m.get("value") == model), {})
 
         presets = BaseChatMessageProcessor.for_provider(agent_provider).get_think_presets(active_model)
         if presets:
-            current_level = window.settings().get(f"chatview_think_level_{agent_provider}") if window else None
+            current_level = _chat_setting(chat_view, f"chatview_think_level_{agent_provider}") if chat_view is not None else None
             return TermChatSetThinkLevelListHandler(
                 current_level=current_level,
                 agent_provider=agent_provider,
@@ -3190,16 +3343,13 @@ class TermChatSetModelListHandler(sublime_plugin.ListInputHandler):
         if not window:
             return []
 
-        window_id = window.id()
-        if window_id not in chatview_clients:
+        chat_view = _target_chat_view(window)
+        session = _session_for_view(chat_view)
+        if session is None or not session.available_models:
             return []
 
-        session = chatview_clients[window_id]
-        if not session.available_models:
-            return []
-
-        agent_provider = window.settings().get(CHAT_AGENT, "claude")
-        think_level = self.think_level or window.settings().get(f"chatview_think_level_{agent_provider}")
+        agent_provider = _chat_setting(chat_view, CHAT_AGENT, "claude")
+        think_level = self.think_level or _chat_setting(chat_view, f"chatview_think_level_{agent_provider}")
 
         items = []
         for m in session.available_models:
@@ -3245,11 +3395,12 @@ class TermChatSetModelTextHandler(sublime_plugin.TextInputHandler):
             return None
 
         window = self.window or sublime.active_window()
-        agent_provider = window.settings().get(CHAT_AGENT, "claude") if window else "claude"
+        chat_view = _target_chat_view(window) if window else None
+        agent_provider = _chat_setting(chat_view, CHAT_AGENT, "claude") if chat_view is not None else "claude"
 
         presets = BaseChatMessageProcessor.for_provider(agent_provider).get_think_presets(None)
         if presets:
-            current_level = window.settings().get(f"chatview_think_level_{agent_provider}") if window else None
+            current_level = _chat_setting(chat_view, f"chatview_think_level_{agent_provider}") if chat_view is not None else None
             return TermChatSetThinkLevelListHandler(
                 current_level=current_level,
                 agent_provider=agent_provider,
@@ -3313,17 +3464,20 @@ class TermChatAgentProviderInputHandler(sublime_plugin.ListInputHandler):
 
 class TermChatSetAgentCommand(sublime_plugin.WindowCommand):
     """
-    Sets the agent provider for ChatView sessions in the current window.
+    Sets the agent provider for the active ChatView session.
     """
     def run(self, agent):
         if agent:
-            current_agent = self.window.settings().get(CHAT_AGENT, "claude")
-            self.window.settings().set(CHAT_AGENT, agent)
+            chat_view = _target_chat_view(self.window)
+            session = _session_for_view(chat_view)
+            current_agent = _chat_setting(chat_view, CHAT_AGENT, "claude") if chat_view is not None else self.window.settings().get(CHAT_AGENT, "claude")
+            if chat_view is not None:
+                _set_chat_setting(chat_view, CHAT_AGENT, agent)
+            else:
+                self.window.settings().set(CHAT_AGENT, agent)
             sublime.status_message(f"ChatView agent provider set to: {agent}")
 
-            window_id = self.window.id()
-            if window_id in chatview_clients:
-                session = chatview_clients[window_id]
+            if session is not None:
                 if agent != current_agent:
                     session.switch_agent(agent)
                 session.model_phantom.update()
@@ -3331,11 +3485,11 @@ class TermChatSetAgentCommand(sublime_plugin.WindowCommand):
             update_agent_model_status(self.window)
 
     def input(self, args):
-        current_agent = self.window.settings().get(CHAT_AGENT, "claude")
-        window_id = self.window.id()
+        chat_view = _target_chat_view(self.window)
+        session = _session_for_view(chat_view)
+        current_agent = _chat_setting(chat_view, CHAT_AGENT, "claude") if chat_view is not None else self.window.settings().get(CHAT_AGENT, "claude")
 
-        if window_id in chatview_clients:
-            session = chatview_clients[window_id]
+        if session is not None:
             # use cached agents if available
             if hasattr(session, "available_agents") and session.available_agents:
                 return TermChatAgentProviderInputHandler(current_agent, session.available_agents)
@@ -3344,8 +3498,8 @@ class TermChatSetAgentCommand(sublime_plugin.WindowCommand):
         settings = sublime.load_settings(f"{PACKAGE_NAME}.sublime-settings")
         available_agents = get_available_agents(settings)
 
-        if window_id in chatview_clients:
-            chatview_clients[window_id].available_agents = available_agents
+        if session is not None:
+            session.available_agents = available_agents
 
         return TermChatAgentProviderInputHandler(current_agent, available_agents)
 
@@ -3358,25 +3512,32 @@ class TermChatSetModelCommand(sublime_plugin.WindowCommand):
         if not model:
             return
         model = model.strip()
-        agent_provider = self.window.settings().get(CHAT_AGENT, "claude")
-        self.window.settings().set(f"chatview_model_{agent_provider}", model)
-        self.window.settings().set(CHAT_MODEL, model)
+        chat_view = _target_chat_view(self.window)
+        session = _session_for_view(chat_view)
+        agent_provider = _chat_setting(chat_view, CHAT_AGENT, "claude") if chat_view is not None else self.window.settings().get(CHAT_AGENT, "claude")
+
+        def _write(key, value):
+            if chat_view is not None:
+                _set_chat_setting(chat_view, key, value)
+            else:
+                self.window.settings().set(key, value)
+
+        _write(f"chatview_model_{agent_provider}", model)
+        _write(CHAT_MODEL, model)
 
         config_updates = {"model": model}
 
         if level:
             level = level.strip()
-            self.window.settings().set(f"chatview_think_level_{agent_provider}", level)
-            self.window.settings().set(CHAT_THINK_LEVEL, level)
+            _write(f"chatview_think_level_{agent_provider}", level)
+            _write(CHAT_THINK_LEVEL, level)
             config_updates["think_level"] = level
             term = "thinking" if agent_provider == "claude" else "reasoning"
             sublime.status_message(f"{PACKAGE_NAME} model set to: {model} ({term}: {level})")
         else:
             sublime.status_message(f"{PACKAGE_NAME} model set to: {model}")
 
-        window_id = self.window.id()
-        session = chatview_clients.get(window_id)
-        if session:
+        if session is not None:
             session.model_phantom.update()
             if session.agent_thread:
                 session.agent_thread.update_config(**config_updates)
@@ -3388,16 +3549,15 @@ class TermChatSetModelCommand(sublime_plugin.WindowCommand):
             return None
 
         # Check if ChatSession has available models
-        window_id = self.window.id()
-        if window_id in chatview_clients:
-            session = chatview_clients[window_id]
-            if session.available_models:
-                # Get current model to highlight it
-                agent_provider = self.window.settings().get(CHAT_AGENT, "claude")
-                current_model = self.window.settings().get(f"chatview_model_{agent_provider}")
-                think_level = self.window.settings().get(f"chatview_think_level_{agent_provider}")
-                # Use ListInputHandler for dropdown selection
-                return TermChatSetModelListHandler(current_model, think_level=think_level, window=self.window)
+        chat_view = _target_chat_view(self.window)
+        session = _session_for_view(chat_view)
+        if session is not None and session.available_models:
+            # Get current model to highlight it
+            agent_provider = _chat_setting(chat_view, CHAT_AGENT, "claude")
+            current_model = _chat_setting(chat_view, f"chatview_model_{agent_provider}")
+            think_level = _chat_setting(chat_view, f"chatview_think_level_{agent_provider}")
+            # Use ListInputHandler for dropdown selection
+            return TermChatSetModelListHandler(current_model, think_level=think_level, window=self.window)
 
         # Fallback to TextInputHandler for manual input
         return TermChatSetModelTextHandler(window=self.window)
@@ -3486,10 +3646,10 @@ class TermChatSetThinkLevelCommand(sublime_plugin.WindowCommand):
     Sets the thinking / reasoning effort level for ChatView sessions in the current window.
     """
     def _get_active_model(self, agent_provider):
-        window_id = self.window.id()
-        if window_id in chatview_clients:
-            session = chatview_clients[window_id]
-            current_model_val = self.window.settings().get(f"chatview_model_{agent_provider}")
+        chat_view = _target_chat_view(self.window)
+        session = _session_for_view(chat_view)
+        if session is not None:
+            current_model_val = _chat_setting(chat_view, f"chatview_model_{agent_provider}")
             if session.available_models and current_model_val:
                 for m in session.available_models:
                     if m.get("value") == current_model_val:
@@ -3500,15 +3660,19 @@ class TermChatSetThinkLevelCommand(sublime_plugin.WindowCommand):
         if not level:
             return
         level = level.strip()
-        agent_provider = self.window.settings().get(CHAT_AGENT, "claude")
-        self.window.settings().set(f"chatview_think_level_{agent_provider}", level)
-        self.window.settings().set(CHAT_THINK_LEVEL, level)
+        chat_view = _target_chat_view(self.window)
+        session = _session_for_view(chat_view)
+        agent_provider = _chat_setting(chat_view, CHAT_AGENT, "claude") if chat_view is not None else self.window.settings().get(CHAT_AGENT, "claude")
+        if chat_view is not None:
+            _set_chat_setting(chat_view, f"chatview_think_level_{agent_provider}", level)
+            _set_chat_setting(chat_view, CHAT_THINK_LEVEL, level)
+        else:
+            self.window.settings().set(f"chatview_think_level_{agent_provider}", level)
+            self.window.settings().set(CHAT_THINK_LEVEL, level)
         term = "thinking level" if agent_provider == "claude" else "reasoning effort"
         sublime.status_message(f"{PACKAGE_NAME} {term} set to: {level}")
 
-        window_id = self.window.id()
-        if window_id in chatview_clients:
-            session = chatview_clients[window_id]
+        if session is not None:
             session.model_phantom.update()
             if session.agent_thread:
                 session.agent_thread.update_config(think_level=level)
@@ -3519,10 +3683,11 @@ class TermChatSetThinkLevelCommand(sublime_plugin.WindowCommand):
         if "level" in args:
             return None
 
-        agent_provider = self.window.settings().get(CHAT_AGENT, "claude")
+        chat_view = _target_chat_view(self.window)
+        agent_provider = _chat_setting(chat_view, CHAT_AGENT, "claude") if chat_view is not None else self.window.settings().get(CHAT_AGENT, "claude")
         active_model = self._get_active_model(agent_provider)
         presets = BaseChatMessageProcessor.for_provider(agent_provider).get_think_presets(active_model)
-        current_level = self.window.settings().get(f"chatview_think_level_{agent_provider}")
+        current_level = _chat_setting(chat_view, f"chatview_think_level_{agent_provider}") if chat_view is not None else self.window.settings().get(f"chatview_think_level_{agent_provider}")
         if presets:
             return TermChatSetThinkLevelListHandler(current_level, agent_provider, active_model, window=self.window)
 
@@ -3589,13 +3754,16 @@ class TermChatApproveModeInputHandler(sublime_plugin.ListInputHandler):
 class TermChatSetApproveModeCommand(sublime_plugin.WindowCommand):
     """Set permission approve mode for the current ChatView session."""
     def run(self, mode):
-        self.window.settings().set(CHAT_APPROVE_MODE, mode)
+        chat_view = _target_chat_view(self.window)
+        session = _session_for_view(chat_view)
+        if chat_view is not None:
+            _set_chat_setting(chat_view, CHAT_APPROVE_MODE, mode)
+        else:
+            self.window.settings().set(CHAT_APPROVE_MODE, mode)
         sublime.status_message(f"Approve mode set to: {mode}")
-        
-        window_id = self.window.id()
-        if window_id in chatview_clients:
-            session = chatview_clients[window_id]
-            agent = self.window.settings().get(CHAT_AGENT)
+
+        if session is not None:
+            agent = _chat_setting(chat_view, CHAT_AGENT)
             if agent == "pi":
                 session.sync_pi_approve_mode(mode)
             elif agent == "opencode":
@@ -3608,7 +3776,8 @@ class TermChatSetApproveModeCommand(sublime_plugin.WindowCommand):
 
     def input(self, args):
         if "mode" not in args:
-            current_mode = self.window.settings().get(CHAT_APPROVE_MODE, ApproveMode.ALLOW_EDIT.value)
+            chat_view = _target_chat_view(self.window)
+            current_mode = _chat_setting(chat_view, CHAT_APPROVE_MODE, ApproveMode.ALLOW_EDIT.value) if chat_view is not None else self.window.settings().get(CHAT_APPROVE_MODE, ApproveMode.ALLOW_EDIT.value)
             return TermChatApproveModeInputHandler(current_mode)
         return None
 
@@ -3624,11 +3793,14 @@ class TermChatTogglePlanModeCommand(sublime_plugin.WindowCommand):
         else:
             plan_mode_enum = PlanMode.FAST
 
-        self.window.settings().set(CHAT_PLAN_MODE, plan_mode_enum.value)
+        chat_view = _target_chat_view(self.window)
+        session = _session_for_view(chat_view)
+        if chat_view is not None:
+            _set_chat_setting(chat_view, CHAT_PLAN_MODE, plan_mode_enum.value)
+        else:
+            self.window.settings().set(CHAT_PLAN_MODE, plan_mode_enum.value)
 
-        window_id = self.window.id()
-        if window_id in chatview_clients:
-            session = chatview_clients[window_id]
+        if session is not None:
             session.model_phantom.update()
             # Update plan mode (reconnects for Claude, dynamic update for Codex)
             session.update_plan_mode(plan_mode=plan_mode_enum)
@@ -3638,7 +3810,8 @@ class TermChatTogglePlanModeCommand(sublime_plugin.WindowCommand):
 
     def input(self, args):
         if "mode" not in args:
-            current_mode = self.window.settings().get(CHAT_PLAN_MODE, PlanMode.FAST.value)
+            chat_view = _target_chat_view(self.window)
+            current_mode = _chat_setting(chat_view, CHAT_PLAN_MODE, PlanMode.FAST.value) if chat_view is not None else self.window.settings().get(CHAT_PLAN_MODE, PlanMode.FAST.value)
             return TermChatPlanModeInputHandler(current_mode)
         return None
 
@@ -3648,9 +3821,8 @@ class TermChatPermissionActionCommand(sublime_plugin.WindowCommand):
     Handle permission actions from the phantom UI.
     """
     def run(self, action, request_id):
-        window_id = self.window.id()
-        if window_id in chatview_clients:
-            session = chatview_clients[window_id]
+        session = _session_for_window(self.window)
+        if session is not None:
             session._handle_permission_decision(request_id, action)
 
 
@@ -3659,9 +3831,8 @@ class TermChatImplementPlanCommand(sublime_plugin.WindowCommand):
     Trigger the 'Implement the plan.' steering message.
     """
     def run(self):
-        window_id = self.window.id()
-        if window_id in chatview_clients:
-            session = chatview_clients[window_id]
+        session = _session_for_window(self.window)
+        if session is not None:
             sublime.status_message("Implementing plan...")
 
             # Display implementation prompt in chat history with gutter highlight
@@ -3688,9 +3859,10 @@ class TermChatInstallAgentCommand(sublime_plugin.WindowCommand):
                 write_fn(f"\n{display_name} installed successfully.\n  Installed at: {found}\n")
             else:
                 write_fn(f"\n{display_name} installed successfully.\n")
-            window_id = self.window.id()
-            if window_id in chatview_clients:
-                session = chatview_clients[window_id]
+            for chat_view in _chat_views_in_window(self.window):
+                session = _session_for_view(chat_view)
+                if session is None:
+                    continue
                 session.available_agents = get_available_agents(settings)
                 # Session was created but aborted early because no CLI was found —
                 # start the agent thread now that one is available.
